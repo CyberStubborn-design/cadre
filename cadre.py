@@ -1,13 +1,14 @@
 """
 Cadre Wire Group - Quote Parser
-Uses extract-msg + pymupdf/pdfminer + local Ollama AI
+Uses extract-msg + pymupdf/pdfminer + Groq AI (cloud)
 
-Ollama setup:
-  1. Install and start Ollama: https://ollama.com
-  2. Pull a model, for example: ollama pull llama3.1:8b
-  3. Optional environment variables:
-     OLLAMA_MODEL=llama3.1:8b
-     OLLAMA_BASE_URL=http://localhost:11434
+Groq setup:
+  1. Get an API key: https://console.groq.com/keys
+  2. Add it to .streamlit/secrets.toml:
+       [groq]
+       api_key = "gsk_..."
+       model   = "llama-3.3-70b-versatile"
+  3. Or set env vars: GROQ_API_KEY, GROQ_MODEL
 """
 
 import re
@@ -36,9 +37,31 @@ try:
 except Exception:
     extract_msg = None
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
-OLLAMA_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
+import time
+
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_TIMEOUT_SECONDS = int(os.environ.get("GROQ_TIMEOUT_SECONDS", "120"))
+GROQ_MAX_RETRIES = 4
+
+
+def _get_groq_credentials():
+    """Read the Groq API key/model from Streamlit secrets, falling back to env vars."""
+    api_key = None
+    model = None
+    try:
+        import streamlit as st
+        api_key = st.secrets.get("groq", {}).get("api_key")
+        model = st.secrets.get("groq", {}).get("model")
+    except Exception:
+        pass
+    api_key = api_key or os.environ.get("GROQ_API_KEY", "")
+    model = model or GROQ_MODEL
+    if not api_key:
+        raise RuntimeError(
+            "Groq API key not found. Add it to .streamlit/secrets.toml under "
+            "[groq] api_key = \"gsk_...\", or set the GROQ_API_KEY environment variable."
+        )
+    return api_key, model
 
 
 SALESPERSON_MAP = {
@@ -149,48 +172,43 @@ def _extract_json_object(raw):
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"Ollama did not return JSON. Response starts with: {raw[:300]!r}")
+        raise ValueError(f"Groq did not return JSON. Response starts with: {raw[:300]!r}")
 
     return json.loads(raw[start:end + 1])
 
 
-def _extract_with_ollama(pdf_text):
-    """Extract quote fields using a locally running Ollama model."""
-    from urllib import request, error
+def _extract_with_groq(pdf_text):
+    """Extract quote fields using the Groq cloud API (llama-3.3-70b-versatile by default)."""
+    from groq import Groq
 
+    api_key, model = _get_groq_credentials()
     pdf_text = _trim_pdf_text(pdf_text)
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [{"role": "user", "content": PROMPT + pdf_text}],
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": 0,
-            "num_predict": 4096,
-        },
-    }
+    client = Groq(api_key=api_key, timeout=GROQ_TIMEOUT_SECONDS)
 
-    req = request.Request(
-        f"{OLLAMA_BASE_URL}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    print(f"{OLLAMA_BASE_URL}/api/chat")
+    last_exc = None
+    for attempt in range(GROQ_MAX_RETRIES):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": PROMPT + pdf_text}],
+                temperature=0,
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content
+            if not raw:
+                raise ValueError("Groq returned an empty response")
+            return _extract_json_object(raw)
+        except Exception as exc:
+            last_exc = exc
+            status = getattr(exc, "status_code", None)
+            is_rate_limit = status == 429 or "rate_limit" in str(exc).lower()
+            if is_rate_limit and attempt < GROQ_MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s, 8s
+                continue
+            break
 
-    try:
-        with request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except error.URLError as exc:
-        raise RuntimeError(
-            "Could not connect to Ollama. Make sure Ollama is running and the "
-            "model is pulled, e.g. `ollama pull llama3.1:8b`."
-        ) from exc
-
-    raw = result.get("message", {}).get("content", "")
-    if not raw:
-        raise ValueError(f"Ollama returned an empty response: {result}")
-    return _extract_json_object(raw)
+    raise RuntimeError(f"Groq extraction failed: {last_exc}") from last_exc
 
 
 def _extract_prices_from_text(pdf_text):
@@ -290,7 +308,7 @@ def _parse_quote_pdf(pdf_bytes):
     text = _pdf_to_text(pdf_bytes)
     if not text.strip():
         raise ValueError("No text could be extracted from this PDF")
-    data     = _extract_with_ollama(text)
+    data     = _extract_with_groq(text)
     q_num    = _clean(data.get("quote_number", "unknown"))
     pdf_name = _make_pdf_name(q_num)
     rows     = _build_rows(data, pdf_name, pdf_text=text)
