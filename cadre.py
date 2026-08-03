@@ -19,18 +19,25 @@ import shutil
 import gc
 
 try:
-    import fitz
+    import pdfplumber
     def _pdf_to_text(pdf_bytes):
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        return "\n".join(page.get_text("text") for page in doc)
+        from io import BytesIO
+        with pdfplumber.open(BytesIO(pdf_bytes)) as doc:
+            return "\n".join(page.extract_text() or "" for page in doc.pages)
 except ImportError:
-    from pdfminer.high_level import extract_text_to_fp
-    from pdfminer.layout import LAParams
-    from io import BytesIO
-    def _pdf_to_text(pdf_bytes):
-        out = BytesIO()
-        extract_text_to_fp(BytesIO(pdf_bytes), out, laparams=LAParams(), output_type="text")
-        return out.getvalue().decode("utf-8", errors="ignore")
+    try:
+        import fitz
+        def _pdf_to_text(pdf_bytes):
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            return "\n".join(page.get_text("text") for page in doc)
+    except ImportError:
+        from pdfminer.high_level import extract_text_to_fp
+        from pdfminer.layout import LAParams
+        from io import BytesIO
+        def _pdf_to_text(pdf_bytes):
+            out = BytesIO()
+            extract_text_to_fp(BytesIO(pdf_bytes), out, laparams=LAParams(), output_type="text")
+            return out.getvalue().decode("utf-8", errors="ignore")
 
 try:
     import extract_msg
@@ -142,7 +149,7 @@ def _is_quote_pdf(filename):
     return bool(re.match(r"quote\s*\d+", filename.lower().strip()))
 
 
-def _trim_pdf_text(text, max_chars=3500):
+def _trim_pdf_text(text, max_chars=8000):
     """
     Remove boilerplate footer text to stay within model token limits.
     Keeps everything up to and including the last line item / tax row.
@@ -215,6 +222,8 @@ def _extract_prices_from_text(pdf_text):
     """
     Extract {item_id: (unit_price, extension)} directly from PDF text using regex.
     Handles fitz EAC (same-line), fitz MFT (cross-line), and pdfminer formats.
+    Kept only as a fallback for older/other PDF layouts — see
+    _parse_line_items_deterministic() for the primary, more reliable parser.
     """
     U = r"(?:FT|EAC|MFT|LOT|EA|PR|C)"
 
@@ -253,11 +262,99 @@ def _extract_prices_from_text(pdf_text):
     return prices
 
 
+# ── Deterministic line-item parser (primary path — no AI/truncation risk) ────
+#
+# On a properly-ordered extraction (pdfplumber), every Cadre quote line looks like:
+#   "<line#> <item_id> <qty> <UNIT> <price><UNIT2> <extension-or-'Canceled'>"
+# e.g. "1 COP3.06.GREEN 40 FT 1,970.00000MFT 78.80"
+#      "6 FUSE.GMT-DUMMY 20 EAC 2.50000EAC Canceled"   (order canceled — no extension)
+_ITEM_LINE_RE = re.compile(
+    r'^(?P<line>\d{1,3})\s+(?P<item_id>\S+)\s+(?P<qty>[\d,]+)\s+(?P<qty_unit>[A-Za-z]{1,5})\s+'
+    r'(?P<price>[\d,]+\.\d+)(?P<price_unit>[A-Za-z]{1,5})\s+(?P<ext>Canceled|[\d,]+\.\d{1,2})\s*$'
+)
+
+# Lines that show up between/around a line item's description due to page breaks —
+# skipped when stitching a multi-line description back together.
+_BOILERPLATE_SKIP_RES = [
+    re.compile(r'^Page\s+\d+\s+of\s+\d+'),
+    re.compile(r'^Quote$'),
+    re.compile(r'^Quote\s+\S+\s+Date\s'),
+    re.compile(r'^Customer\s+\S+$'),
+    re.compile(r'^Contact\s'),
+    re.compile(r'^Salesperson\s'),
+    re.compile(r'^Line\s+Item\s+Ordered\s+Price\s+Extension$'),
+]
+_TOTALS_STOP_RES = [re.compile(r'^Product\b'), re.compile(r'^Tax\b'), re.compile(r'^Total\b')]
+
+_TOTALS_RE = {
+    "product": re.compile(r'^Product\s+([\d,]+\.\d{2})'),
+    "tax":     re.compile(r'^Tax\s+([\d,]+\.\d{2})'),
+    "total":   re.compile(r'^Total\s+([\d,]+\.\d{2})'),
+}
+
+
+def _parse_line_items_deterministic(pdf_text):
+    """
+    Parse every line item directly from the PDF text via regex — guarantees the
+    row count matches the PDF exactly (including canceled lines, which carry no
+    extension). Returns [] if the text doesn't match this layout, so callers can
+    fall back to the AI-provided line items.
+    """
+    lines = [ln.strip() for ln in pdf_text.split("\n")]
+    n = len(lines)
+    items = []
+
+    for i, ln in enumerate(lines):
+        m = _ITEM_LINE_RE.match(ln)
+        if not m:
+            continue
+
+        ext_raw = m.group("ext")
+        canceled = ext_raw.lower() == "canceled"
+
+        desc_parts = []
+        j = i + 1
+        while j < n:
+            l2 = lines[j]
+            if not l2:
+                j += 1
+                continue
+            if _ITEM_LINE_RE.match(l2) or any(p.match(l2) for p in _TOTALS_STOP_RES):
+                break
+            if any(p.match(l2) for p in _BOILERPLATE_SKIP_RES):
+                j += 1
+                continue
+            desc_parts.append(l2)
+            j += 1
+
+        desc = " ".join(desc_parts).strip()
+        if canceled:
+            desc = f"{desc} [CANCELED]".strip() if desc else "[CANCELED]"
+
+        items.append({
+            "item_id":    m.group("item_id"),
+            "item_desc":  desc,
+            "unit_price": float(m.group("price").replace(",", "")),
+            "extension":  0.0 if canceled else float(ext_raw.replace(",", "")),
+        })
+
+    return items
+
+
+def _parse_totals_deterministic(pdf_text):
+    """Parse Product/Tax/Total straight from the PDF text. Returns {} if not found."""
+    totals = {}
+    for ln in pdf_text.split("\n"):
+        ln = ln.strip()
+        for key, pattern in _TOTALS_RE.items():
+            m = pattern.match(ln)
+            if m:
+                totals[key] = float(m.group(1).replace(",", ""))
+    return totals
+
+
 def _build_rows(data, pdf_name, pdf_text=""):
     salesperson = _clean(data.get("salesperson", ""))
-
-    # Extract prices from PDF text as ground truth (overrides AI values)
-    price_map = _extract_prices_from_text(pdf_text) if pdf_text else {}
 
     base = {
         "ReferralManager":   "",
@@ -282,25 +379,56 @@ def _build_rows(data, pdf_name, pdf_text=""):
         "PDF":               pdf_name,
         "DemoQuote":         "",
     }
+
+    # Primary path: parse every line item directly out of the PDF text. This
+    # guarantees the row count matches the PDF (including canceled lines,
+    # which the AI can drop since they have no numeric extension) and is
+    # immune to the AI's input-length truncation.
+    det_items = _parse_line_items_deterministic(pdf_text) if pdf_text else []
+
+    if det_items:
+        line_items = det_items
+        tax_amount = _parse_totals_deterministic(pdf_text).get("tax", data.get("tax"))
+    else:
+        # Fallback: unfamiliar layout — use the AI's own line_items, with the
+        # older regex price map overriding its unit_price/extension where it matches.
+        price_map = _extract_prices_from_text(pdf_text) if pdf_text else {}
+        line_items = []
+        for item in data.get("line_items", []):
+            item_id = _clean(item.get("item_id", ""))
+            if item_id in price_map:
+                unit_price, total_sales = price_map[item_id]
+            else:
+                unit_price, total_sales = item.get("unit_price", ""), item.get("extension", "")
+            line_items.append({
+                "item_id": item_id,
+                "item_desc": item.get("item_desc", ""),
+                "unit_price": unit_price,
+                "extension": total_sales,
+            })
+        # The AI prompt asks it to include Tax as its own line item already —
+        # don't double it up with the tax_amount block below.
+        tax_amount = None if any(_clean(i["item_id"]).lower() == "tax" for i in line_items) else data.get("tax")
+
     rows = []
-    for item in data.get("line_items", []):
-        item_id = _clean(item.get("item_id", ""))
-
-        if item_id in price_map:
-            unit_price  = price_map[item_id][0]
-            total_sales = price_map[item_id][1]
-        else:
-            unit_price  = item.get("unit_price", "")
-            total_sales = item.get("extension", "")
-
+    for item in line_items:
         row = {
             **base,
-            "item_id":    item_id,
+            "item_id":    _clean(item.get("item_id", "")),
             "item_desc":  _clean(item.get("item_desc", "")),
-            "Unit Price": unit_price,
-            "TotalSales": total_sales,
+            "Unit Price": item.get("unit_price", ""),
+            "TotalSales": item.get("extension", ""),
         }
         rows.append({h: row.get(h, "") for h in HEADERS})
+
+    # Tax as its own row (skip if the AI already included one and we have no
+    # deterministic items to dedupe against — det_items path never includes Tax).
+    if tax_amount not in (None, ""):
+        rows.append({
+            **{h: base.get(h, "") for h in HEADERS},
+            "item_id": "Tax", "item_desc": "", "Unit Price": tax_amount, "TotalSales": tax_amount,
+        })
+
     return rows
 
 
